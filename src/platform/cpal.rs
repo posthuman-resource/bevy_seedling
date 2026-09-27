@@ -1,13 +1,13 @@
 //! Stream management for `cpal`.
 
 use bevy_app::prelude::*;
-use bevy_ecs::prelude::*;
 use bevy_log::{error, warn};
 use firewheel::cpal::{self};
+use std::num::NonZeroU32;
 
 use crate::{
     SeedlingSystems,
-    context::{AudioContext, SampleRate, StreamRestartEvent},
+    context::{AudioContext, SampleRate, StreamFailedEvent, StreamRestartEvent},
     platform::*,
     prelude::SeedlingStartupSystems,
     resource_changed_without_insert,
@@ -86,13 +86,18 @@ impl Plugin for CpalPlatformPlugin {
     }
 }
 
+/// The rate the graph is wired at when no stream ever started.
+const SILENT_SAMPLE_RATE: NonZeroU32 = NonZeroU32::new(48_000).unwrap();
+
+/// Start the stream, or, when there is no device to start it on, run silent:
+/// the graph is still initialized (at [`SILENT_SAMPLE_RATE`]) so every
+/// connection lands, and a [`StreamFailedEvent`] says why nothing is heard.
 fn start_stream(
     mut context: ResMut<AudioContext>,
     stream_config: Res<AudioStreamConfig<CpalConfig>>,
-    commands: Commands,
-) -> Result {
-    // TODO: it's not possible for the user to recover if this fails
-    let sample_rate = context.with_store(|context, store| {
+    mut commands: Commands,
+) {
+    let started = context.with_store(|context, store| {
         let stream = cpal::CpalStream::new(context, stream_config.0.clone())?;
         let sample_rate = stream.info().sample_rate;
 
@@ -100,11 +105,20 @@ fn start_stream(
         debug_assert!(previous.is_none());
 
         Ok::<_, StartStreamError>(sample_rate)
-    })?;
+    });
+
+    let sample_rate = match started {
+        Ok(sample_rate) => sample_rate,
+        Err(error) => {
+            warn!("audio: no output stream ({error}); running silent");
+            commands.trigger(StreamFailedEvent {
+                error: error.to_string(),
+            });
+            SILENT_SAMPLE_RATE
+        }
+    };
 
     super::initialize_stream(SampleRate::new(sample_rate), commands);
-
-    Ok(())
 }
 
 fn poll_stream(mut context: ResMut<AudioContext>, mut commands: Commands) -> Result {
@@ -166,14 +180,17 @@ fn observe_restart(_: On<RestartAudioStream>, mut config: ResMut<AudioStreamConf
     config.set_changed();
 }
 
+/// Replace the stream. When the new one cannot start, the old one is gone
+/// all the same: the app runs silent at the old rate and a
+/// [`StreamFailedEvent`] says why.
 fn restart_stream(
     stream_config: Res<AudioStreamConfig<CpalConfig>>,
     mut graph: ResMut<AudioContext>,
     sample_rate: Res<SampleRate>,
     mut commands: Commands,
-) -> Result {
+) {
     // drop it like it's hot
-    let current_rate = graph.with_store(|context, store| {
+    let restarted = graph.with_store(|context, store| {
         let _ = store.remove::<cpal::CpalStream>();
 
         let stream = cpal::CpalStream::new(context, stream_config.0.clone())?;
@@ -181,7 +198,18 @@ fn restart_stream(
         store.insert(stream);
 
         Ok::<_, StartStreamError>(sample_rate)
-    })?;
+    });
+
+    let current_rate = match restarted {
+        Ok(rate) => rate,
+        Err(error) => {
+            warn!("audio: the output stream could not restart ({error}); running silent");
+            commands.trigger(StreamFailedEvent {
+                error: error.to_string(),
+            });
+            return;
+        }
+    };
 
     let previous_rate = sample_rate.get();
     sample_rate.set(current_rate);
@@ -190,6 +218,4 @@ fn restart_stream(
         previous_rate,
         current_rate,
     });
-
-    Ok(())
 }

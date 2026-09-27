@@ -240,6 +240,19 @@ pub struct StreamStartEvent {
     pub sample_rate: NonZeroU32,
 }
 
+/// An event triggered when a backend cannot start or restart its stream:
+/// no output device, a device that cannot report a configuration, one that
+/// vanished and did not come back.
+///
+/// The app keeps running. The graph stays wired at the last known sample
+/// rate (a nominal 48 kHz if no stream ever started), but no processor runs
+/// behind it, so nothing is heard until a later restart succeeds.
+#[derive(Event, Debug, Clone)]
+pub struct StreamFailedEvent {
+    /// Why the stream could not start, for the log and the user.
+    pub error: String,
+}
+
 /// An event triggered just before the audio stream restarts.
 ///
 /// This allows components to temporarily store any state
